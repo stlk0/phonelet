@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "phonelet"
+version = "0.1.0"
+description = "Self-hosted single-SIM GSM-to-SIP gateway and SMS forwarder for Huawei voice-capable 3G USB modems compatible with chan_dongle; only the E1550 (firmware 11.608.13.02.00) has been tested on hardware"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE", "COPYING.GPL-2.0", "NOTICE"]
+dependencies = [
+    "fastapi==0.135.2",
+    "uvicorn==0.42.0",
+    "aiosqlite==0.22.1",
+    "httpx==0.28.1",
+    "pydantic-settings==2.14.2",
+    "python-dotenv==1.2.2",
+    "cryptography==50.0.2",
+]
+
+[project.urls]
+Repository = "https://github.com/stlk0/phonelet"
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.0.3",
+    "pytest-asyncio==1.3.0",
+    "ruff==0.17.4",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+# Test parameters named after pytest fixtures imported from other test modules shadow those imports.
+"tests/**" = ["F811"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "driver: compiles the patched chan_dongle C code and runs it (needs cc and patch); pick with -m driver or -m 'not driver'",
+    "history_rebuild: leave the first ingress pass pending to test history rebuilding",
+]

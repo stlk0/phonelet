@@ -1,0 +1,18 @@
+[Unit]
+Description=Phonelet modem power
+Before=asterisk.service
+# Keep retrying a holder that exits (for example, a busy line): no start limit.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# Orange Pi Zero 2W PH4 (physical pin 18). Override Environment= with
+# systemctl edit phonelet-modem-power if the GPIO chip or line differs.
+Environment=MODEM_POWER_CHIP=gpiochip1
+Environment=MODEM_POWER_LINE=228
+ExecStart=/usr/bin/gpioset -c ${MODEM_POWER_CHIP} -C modem-power ${MODEM_POWER_LINE}=1
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target asterisk.service

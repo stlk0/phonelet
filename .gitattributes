@@ -1,0 +1,5 @@
+# Unified diffs prefix source indentation and blank context lines with a space.
+*.patch -whitespace
+# Keep hash-verified upstream test inputs byte-for-byte, including whitespace.
+tests/fixtures/chan_dongle/* -whitespace
+archive-revision export-subst

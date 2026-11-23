@@ -1,0 +1,42 @@
+Phonelet licensing and third-party sources
+
+Original Phonelet code, scripts, configuration and documentation are licensed
+under the MIT License in LICENSE. Copyright (c) 2026 stlk0.
+The following third-party code and derivative patches have separate terms;
+the MIT license does not replace their licenses or copyright notices.
+
+* chan_dongle_patch/*.patch: GPL-2.0, derivative works of chan_dongle.
+  Target: https://github.com/wdoekes/asterisk-chan-dongle
+  commit 7db8e75bc2b7c81b173e1bb465e376e64a70319a (asterisk/sources.lock).
+  chan_dongle_unexpected_error.patch and chan_dongle_command_deadline.patch
+  also incorporate changes by Sheepsticked from
+  https://github.com/Sheepsticked/aster, commit 65e5a21:
+  docker/asterisk/patches/0013-chan-dongle-unexpected-error.patch and
+  docker/asterisk/patches/0010-chan-dongle-user-command-deadline.patch,
+  respectively, under GPL-2.0 as recorded in their headers.
+
+* tests/fixtures/chan_dongle/: the unmodified chan_dongle source subset from
+  the same repository and commit, under GPL-2.0, with the exception below.
+  Upstream authors and notices remain in the source headers and COPYRIGHT.txt;
+  the original license remains in LICENSE.txt. SHA256.json records the files.
+
+* tests/fixtures/chan_dongle/memmem.c: Copyright (c) 2005 Pascal Gloor,
+  under the BSD 3-Clause terms reproduced in its header. This implementation
+  is included in the chan_dongle snapshot at the commit above; its original
+  notice, conditions and disclaimer are retained.
+
+* tests/fixtures/asterisk_args.c and tests/fixtures/asterisk_base64.c:
+  GPL-2.0 excerpts from main/app.c and main/utils.c, respectively, in
+  https://github.com/asterisk/asterisk, Asterisk 20.22.0,
+  commit 7c225dc47bb43bf9862b2b147ed565b7b6113fed (asterisk/sources.lock
+  and the fixture headers).
+
+* The Asterisk archives asterisk-VERSION-ARCH.tar.gz (release asterisk-VERSION-N)
+  contain Asterisk and the patched chan_dongle module built from the sources
+  pinned in asterisk/sources.lock, under GPL-2.0. The corresponding source,
+  asterisk-VERSION-N-source.tar.gz, is attached to the same release
+  (docs/building.md, "Release archives").
+
+The complete GNU General Public License version 2 is in COPYING.GPL-2.0.
+The MIT service does not link to chan_dongle; it communicates with the driver
+through an on-disk journal and Asterisk Manager Interface (AMI).

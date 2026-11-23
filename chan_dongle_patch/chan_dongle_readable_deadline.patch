@@ -1,0 +1,26 @@
+Expire a sent command at its deadline even while the port stays readable.
+
+Upstream waits pvt->timeout again once the deadline has passed, and only a
+silent wait expires the command. With data= on PCUI, URCs such as ^RSSI or
+^BOOT arriving more often than that keep a command without a reply waiting
+forever.
+Taken from the former phonelet URC port patch: only this check of its
+monitor loop, without its second port. Applies after command-deadline.
+License: GPL-2.0 (same as chan_dongle).
+--- a/chan_dongle.c
++++ b/chan_dongle.c
+@@ -522,6 +522,14 @@
+ 		}
+ 
+ 		t = at_queue_timeout(pvt);
++		ecmd = at_queue_head_cmd(pvt);
++		/* A sent command keeps its deadline even when the port stays readable.
++		 * Negative timeout also means no sent command, so inspect the head. */
++		if (ecmd && ecmd->length == 0 && t <= 0)
++		{
++			ast_log (LOG_ERROR, "[%s] timedout while waiting '%s' in response to '%s'\n", dev, at_res2str (ecmd->res), at_cmd2str (ecmd->cmd));
++			goto e_cleanup;
++		}
+ 		if(t < 0)
+ 			t = pvt->timeout;
+ 

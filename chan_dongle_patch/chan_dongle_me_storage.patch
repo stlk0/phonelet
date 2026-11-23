@@ -1,0 +1,578 @@
+Receive SMS in ME and periodically recover both memories with bounded polls.
+
+The E1550 SIM answers 6F02 when the modem stores some short last parts of a
+long SMS, and the network then retries or drops them. Stored in ME, the modem
+itself acknowledges every part to the network.
+The init list selects AT+CPMS="ME","ME","ME" (the modem keeps the receive
+memory across power cycles; read and write are SM again after ATZ). After
+its OK, AT+CPMS="SM" changes only the memory read and deleted, so SMS keep
+arriving in ME while the SIM is read in full; then AT+CPMS="ME" and ME is
+read in full. If the modem rejects ME, a WARNING is logged, the init list
+goes on, and AT+CPMS="SM","SM","SM" keeps SMS enabled on the SIM.
+The read memory changes only with no read in flight and no slot waiting;
+the FIFO queue sends AT+CPMS after the last CMGR and CMGD of the other
+memory. A +CMTI naming the memory being read is read at once. One naming
+the other memory ("ME" while the SIM is read, or "SM" for an SMS the modem
+still stores on the SIM) never reads or deletes the slot with that number
+in the memory being read: that memory is selected for reading when the
+inbox is idle, read in full, and reading returns to ME. A memory the modem
+rejects for reading is selected again for each later +CMTI that names it.
+Any other memory name gets a WARNING without SMS content. Reading still
+journals before deletion (ingress patch).
+A full read covers slots below the total of the first pair in the
+response to the existing AT+CPMS selection, or all 256 slots without valid
+counts; used is not a bound, since new SMS take the lowest free slots. The
+startup read starts once the selection answers. Empty slots of a full read
+are not logged as errors. If a selection of the startup or a periodic pass
+is rejected before any memory was read in it, the memory still selected is
+read in full once.
+600 s (CLOCK_MONOTONIC) after the startup or the previous pass finished,
+an idle monitor reads SM, then ME, keeping the receive memory. Channels,
+dialing, call waiting, a RING within 60 s, queued commands, reads, slots and
+journal retry backoff defer a pass. A pass whose AT+CPMS is not sent ends
+with a WARNING; NOTICE logs mark passes with per-memory counts only. A
+reconnect replaces the old memory's retry with a fresh read.
+Applies after readable-deadline.
+License: GPL-2.0 (same as chan_dongle).
+--- a/at_command.c
++++ b/at_command.c
+@@ -160,7 +160,8 @@
+ 		ATQ_CMD_DECLARE_ST(CMD_AT_CMGF, "AT+CMGF=0\r"),
+ 
+ 		/* SMS Storage Selection */
+-		ATQ_CMD_DECLARE_ST(CMD_AT_CPMS, "AT+CPMS=\"SM\",\"SM\",\"SM\"\r"),
++		/* Phonelet: receive into the modem memory; an error does not end the list */
++		ATQ_CMD_DECLARE_STI(CMD_AT_CPMS, "AT+CPMS=\"ME\",\"ME\",\"ME\"\r"),
+ 		/* New SMS Notification Setting +CNMI=[<mode>[,<mt>[,<bm>[,<ds>[,<bfr>]]]]] */
+ 		/* pvt->initialized = 1 after successful of CMD_AT_CNMI */
+ 		ATQ_CMD_DECLARE_ST(CMD_AT_CNMI, "AT+CNMI=2,1,0,2,0\r"),
+@@ -710,11 +711,103 @@
+ 			break;
+ 	}
+ 
++	/* Explicit +CMTI/retry slots first, then the full read: slots below the
++	 * CPMS total, or all of them without valid counts. */
++	if (i == SMS_INDEX_MAX && pvt->phonelet_poll_active)
++	{
++		unsigned int limit = pvt->phonelet_counts_valid ? pvt->phonelet_total : SMS_INDEX_MAX;
++		while (pvt->phonelet_poll_cursor < limit &&
++		       pvt->phonelet_poll_seen[pvt->phonelet_poll_cursor])
++			pvt->phonelet_poll_cursor++;
++		if (pvt->phonelet_poll_cursor < limit)
++		{
++			i = pvt->phonelet_poll_cursor++;
++			/* an empty slot is normal in a full read */
++			suppress_error = SUPPRESS_ERROR_ENABLED;
++		}
++		else
++			pvt->phonelet_poll_active = 0;
++	}
++
+ 	if (i == SMS_INDEX_MAX ||
+ 	    at_enqueue_retrieve_sms(cpvt, i, suppress_error) != 0)
+ 	{
+ 		pvt_try_restate(pvt);
+ 	}
++	/* Phonelet: this memory is read through; the next one may follow. */
++	if (i == SMS_INDEX_MAX)
++		phonelet_storage_next(cpvt);
++}
++
++/*!
++ * \brief Phonelet: queue AT+CPMS for an SMS memory
++ * \param cpvt -- cpvt structure
++ * \param mem -- PHONELET_MEM_SM or PHONELET_MEM_ME to read and delete; with
++ * PHONELET_MEM_ALL also to write and receive
++ * \param athead -- queue after the head task, before the reads already queued
++ *
++ * Without PHONELET_MEM_ALL only <mem1> changes: the modem keeps receiving
++ * into the memory set before, ME, and keeps that one across power cycles.
++ */
++EXPORT_DEF void phonelet_storage_select(struct cpvt *cpvt, unsigned int mem, int athead)
++{
++	pvt_t *pvt = cpvt->pvt;
++	const char *name = PHONELET_MEM_NAME(mem);
++	at_queue_cmd_t cmds[] = {
++		ATQ_CMD_DECLARE_DYN(CMD_AT_CPMS_SELECT),
++	};
++	int err;
++
++	if (mem & PHONELET_MEM_ALL)
++		err = at_fill_generic_cmd(&cmds[0], "AT+CPMS=\"%s\",\"%s\",\"%s\"\r", name, name, name);
++	else
++		err = at_fill_generic_cmd(&cmds[0], "AT+CPMS=\"%s\"\r", name);
++	if (err || at_queue_insert(cpvt, cmds, ITEMS_OF(cmds), athead))
++	{
++		ast_log(LOG_ERROR, "[%s] Error queueing SMS storage %s\n", PVT_ID(pvt), name);
++		/* A pass (startup or periodic) cannot go on: next one after the interval */
++		if (pvt->phonelet_rescan_active)
++		{
++			struct timespec now;
++			clock_gettime(CLOCK_MONOTONIC, &now);
++			pvt->phonelet_rescan_active = 0;
++			pvt->phonelet_rescan_end = now.tv_sec;
++			ast_log(LOG_WARNING, "[%s] SMS rescan stopped: storage selection not sent\n", PVT_ID(pvt));
++		}
++		return;
++	}
++	pvt->phonelet_counts_valid = 0;
++	pvt->phonelet_mem_switch = mem;
++}
++
++/*!
++ * \brief Phonelet: select the next SMS memory to read once the inbox is idle
++ * \param cpvt -- cpvt structure
++ *
++ * SMS are received into ME. A memory a +CMTI named while another one was
++ * read is selected next and read in full, then reading returns to ME,
++ * unless the modem rejected ME and no +CMTI named ME since.
++ * AT+CPMS is queued only with no read in flight and no slot waiting, so the
++ * FIFO queue sends it after the CMGR and CMGD of the previous memory.
++ */
++EXPORT_DEF void phonelet_storage_next(struct cpvt *cpvt)
++{
++	pvt_t *pvt = cpvt->pvt;
++	unsigned int mem, i;
++
++	if (pvt->phonelet_mem_switch || pvt->incoming_sms_index != -1U)
++		return;
++	for (i = 0; i != SMS_INDEX_MAX; i++)
++	{
++		if (is_sms_inbox_set(pvt, i))
++			return;
++	}
++
++	mem = pvt->phonelet_mem_pending & ~pvt->phonelet_mem_failed & ~pvt->phonelet_mem;
++	if (!mem && pvt->phonelet_mem != PHONELET_MEM_ME && !(pvt->phonelet_mem_failed & PHONELET_MEM_ME))
++		mem = PHONELET_MEM_ME;
++	if (mem)
++		phonelet_storage_select(cpvt, mem, 0);
+ }
+ 
+ /*!
+--- a/at_command.h
++++ b/at_command.h
+@@ -79,6 +79,7 @@
+ 	_( AT_CHLD_2,       "AT+CHLD=2") \
+ 	_( AT_CHLD_3,       "AT+CHLD=3") \
+ 	_( AT_CLCC,         "AT+CLCC") \
++	_( AT_CPMS_SELECT,  "AT+CPMS=") \
+ /* AT_COMMANDS_TABLE */
+ 
+ typedef enum {
+@@ -90,6 +91,14 @@
+ 	SUPPRESS_ERROR_ENABLED
+ } at_cmd_suppress_error_t;
+ 
++/* Phonelet: SMS memories for AT+CPMS, as bits of a mask */
++#define PHONELET_RESCAN_INTERVAL 600 /* seconds after a full pass finishes */
++#define PHONELET_RING_WINDOW 60 /* seconds a RING alone defers a pass */
++#define PHONELET_MEM_SM		1	/* SIM card */
++#define PHONELET_MEM_ME		2	/* modem memory, where SMS are received */
++#define PHONELET_MEM_ALL	4	/* with a memory: also write and receive there */
++#define PHONELET_MEM_NAME(mem)	((mem) & PHONELET_MEM_ME ? "ME" : "SM")
++
+ /*!
+  * \brief Get the string representation of the given AT command
+  * \param cmd -- the command to process
+@@ -122,6 +131,8 @@
+ EXPORT_DECL int at_enqueue_retrieve_sms(struct cpvt *cpvt, int index, at_cmd_suppress_error_t suppress_error);
+ EXPORT_DECL int at_enqueue_delete_sms(struct cpvt *cpvt, int index);
+ EXPORT_DECL int phonelet_enqueue_sms_sync(struct cpvt *cpvt);
++EXPORT_DECL void phonelet_storage_select(struct cpvt *cpvt, unsigned int mem, int athead);
++EXPORT_DECL void phonelet_storage_next(struct cpvt *cpvt);
+ EXPORT_DECL int at_enqueue_hangup(struct cpvt *cpvt, int call_idx);
+ EXPORT_DECL int at_enqueue_volsync(struct cpvt *cpvt);
+ EXPORT_DECL int at_enqueue_clcc(struct cpvt *cpvt);
+--- a/at_response.c
++++ b/at_response.c
+@@ -63,6 +63,159 @@
+ 	return "UNDEFINED";
+ }
+ 
++/* Only the first pair describes the memory used for CMGR/CMGD; its total
++ * bounds the full read. Ignore unsolicited, missing or malformed counts; the
++ * fallback is all 256 slots. */
++static void phonelet_storage_counts(struct pvt *pvt, const char *str)
++{
++	const at_queue_cmd_t *cmd = at_queue_head_cmd(pvt);
++	int used, total, end = 0;
++	if (!cmd || (cmd->cmd != CMD_AT_CPMS && cmd->cmd != CMD_AT_CPMS_SELECT))
++		return;
++	pvt->phonelet_counts_valid = 0;
++	if (sscanf(str, "+CPMS: %9d , %9d %n", &used, &total, &end) != 2 || !end
++	    || (str[end] && str[end] != ',') || used < 0 || total < 0
++	    || used > total || total > SMS_INDEX_MAX)
++		return;
++	pvt->phonelet_total = total;
++	pvt->phonelet_counts_valid = 1;
++}
++
++/*!
++ * \brief Phonelet: result of AT+CPMS="ME","ME","ME" in the init list
++ * \param pvt -- pvt structure
++ * \param ok -- the modem answered OK
++ *
++ * After OK the SIM is read first: AT+CPMS="SM" changes only the memory to
++ * read, so SMS keep arriving in ME, and it is queued before the full read
++ * that follows the init list. After an error SMS stays enabled on the SIM,
++ * for read, write and receive.
++ */
++static void phonelet_storage_init(struct pvt *pvt, int ok)
++{
++	if (!ok)
++	{
++		pvt->phonelet_mem_failed |= PHONELET_MEM_ME;
++		ast_log(LOG_WARNING, "[%s] Modem rejected SMS storage ME, keeping SM\n", PVT_ID(pvt));
++		phonelet_storage_select(&pvt->sys_chan, PHONELET_MEM_SM | PHONELET_MEM_ALL, 1);
++		return;
++	}
++	pvt->phonelet_mem = PHONELET_MEM_ME;
++	ast_log(LOG_NOTICE, "[%s] SMS storage ME selected for read, write and receive\n", PVT_ID(pvt));
++	if (!CONF_SHARED(pvt, disablesms))
++		phonelet_storage_select(&pvt->sys_chan, PHONELET_MEM_SM, 1);
++}
++
++/*!
++ * \brief Phonelet: result of a queued AT+CPMS selection
++ * \param pvt -- pvt structure
++ * \param ok -- the modem answered OK
++ *
++ * After OK the selected memory is read in full. After an error the modem
++ * keeps the memory selected before, and SMS stays enabled there; that memory
++ * is read in full again if a +CMTI named it while the selection was queued,
++ * or if the startup or periodic pass has read no memory yet. The memory
++ * rejected is selected again for a +CMTI naming it or by the next pass.
++ */
++static void phonelet_storage_selected(struct pvt *pvt, int ok)
++{
++	unsigned int request = pvt->phonelet_mem_switch;
++	unsigned int mem = request & (PHONELET_MEM_SM | PHONELET_MEM_ME);
++	const char *scope = request & PHONELET_MEM_ALL ? "read, write and receive" : "reading";
++
++	pvt->phonelet_mem_switch = 0;
++	pvt->phonelet_mem_pending &= ~mem;
++	if (!mem)
++		return;
++	if (ok)
++	{
++		pvt->phonelet_mem = mem;
++		pvt->phonelet_rescan_polled = 1;
++		ast_log(LOG_NOTICE, "[%s] SMS storage %s selected for %s\n", PVT_ID(pvt), PHONELET_MEM_NAME(mem), scope);
++		if (!CONF_SHARED(pvt, disablesms) && at_poll_sms(pvt))
++			ast_log(LOG_ERROR, "[%s] Error reading SMS storage %s\n", PVT_ID(pvt), PHONELET_MEM_NAME(mem));
++		return;
++	}
++	/* The SIM after a rejected ME stays the memory read: it is not marked */
++	if (!(request & PHONELET_MEM_ALL))
++		pvt->phonelet_mem_failed |= mem;
++	ast_log(LOG_WARNING, "[%s] Modem rejected SMS storage %s for %s, keeping %s\n", PVT_ID(pvt),
++	    PHONELET_MEM_NAME(mem), scope, PHONELET_MEM_NAME(pvt->phonelet_mem));
++	/* Read the memory kept in full: a +CMTI named it meanwhile, or this
++	 * startup or periodic pass has read nothing yet. Once, no retry. */
++	if ((pvt->phonelet_mem_pending & pvt->phonelet_mem)
++	    || (pvt->phonelet_rescan_active && !pvt->phonelet_rescan_polled))
++	{
++		pvt->phonelet_mem_pending &= ~pvt->phonelet_mem;
++		pvt->phonelet_rescan_polled = 1;
++		if (!CONF_SHARED(pvt, disablesms) && at_poll_sms(pvt))
++			ast_log(LOG_ERROR, "[%s] Error reading SMS storage %s\n", PVT_ID(pvt), PHONELET_MEM_NAME(pvt->phonelet_mem));
++		return;
++	}
++	phonelet_storage_next(&pvt->sys_chan);
++}
++
++/*!
++ * \brief Phonelet: memory named by +CMTI: <mem>,<index>
++ * \return PHONELET_MEM_SM, PHONELET_MEM_ME, or 0 for another name
++ */
++static unsigned int phonelet_storage_parse(const char *str)
++{
++	const char *name = strchr(str, ':');
++	unsigned int mem;
++
++	if (!name)
++		return 0;
++	name += 1 + strspn(name + 1, " ");
++	if (*name == '"')
++		name++;
++	if (!strncasecmp(name, "SM", 2))
++		mem = PHONELET_MEM_SM;
++	else if (!strncasecmp(name, "ME", 2))
++		mem = PHONELET_MEM_ME;
++	else
++		return 0;
++	name += 2;
++	if (*name == '"')
++		name++;
++	name += strspn(name, " ");
++	return *name == ',' ? mem : 0;
++}
++
++/*!
++ * \brief Phonelet: read a +CMTI slot only from the memory it names
++ * \param pvt -- pvt structure
++ * \param str -- the +CMTI line, without SMS content
++ * \param index -- slot in that memory
++ * \retval  0 success
++ * \retval -1 the read could not be queued
++ *
++ * A slot of the memory being read is read at once. Another memory waits:
++ * it is selected for reading when the inbox is idle and read in full, then
++ * reading returns to ME. This covers "ME" while the SIM is read and "SM"
++ * for an SMS the modem still stores on the SIM. A memory being selected is
++ * read in full anyway. A memory the modem rejected is selected again, once
++ * for each +CMTI naming it. A slot of another memory never enters the
++ * inbox, so CMGR and CMGD of one memory never use the other's slot.
++ */
++static int phonelet_storage_notice(struct pvt *pvt, const char *str, int index)
++{
++	unsigned int mem = phonelet_storage_parse(str);
++
++	if (!mem)
++	{
++		ast_log(LOG_WARNING, "[%s] New SMS in slot %d of a memory that is not read; it stays there\n", PVT_ID(pvt), index);
++		return 0;
++	}
++	/* A rejected memory gets one more selection for this SMS */
++	pvt->phonelet_mem_failed &= ~mem;
++	if (!pvt->phonelet_mem_switch && mem == pvt->phonelet_mem)
++		return at_enqueue_retrieve_sms(&pvt->sys_chan, index, SUPPRESS_ERROR_DISABLED);
++	pvt->phonelet_mem_pending |= mem;
++	phonelet_storage_next(&pvt->sys_chan);
++	return 0;
++}
++
+ /*!
+  * \brief Phonelet: an inbox CMGR answered by OK or an error instead of +CMGR
+  * \param pvt -- pvt structure
+@@ -170,6 +323,11 @@
+ 
+ 			case CMD_AT_CPMS:
+ 				ast_debug (1, "[%s] SMS storage location is established\n", PVT_ID(pvt));
++				phonelet_storage_init(pvt, 1);
++				break;
++
++			case CMD_AT_CPMS_SELECT:
++				phonelet_storage_selected(pvt, 1);
+ 				break;
+ 
+ 			case CMD_AT_CNMI:
+@@ -412,8 +570,16 @@
+ 				log_cmd_response_error(pvt, ecmd, "[%s] Error Supplementary Service Notification activation failed\n", PVT_ID(pvt));
+ 				goto e_return;
+ 
+-			case CMD_AT_CMGF:
++			/* Phonelet: SMS stays enabled, on the SIM if the modem rejects ME */
+ 			case CMD_AT_CPMS:
++				phonelet_storage_init(pvt, 0);
++				break;
++
++			case CMD_AT_CPMS_SELECT:
++				phonelet_storage_selected(pvt, 0);
++				break;
++
++			case CMD_AT_CMGF:
+ 			case CMD_AT_CNMI:
+ 				ast_debug (1, "[%s] Command '%s' failed\n", PVT_ID(pvt), at_cmd2str (ecmd->cmd));
+ 				ast_debug (1, "[%s] No SMS support\n", PVT_ID(pvt));
+@@ -1133,7 +1299,12 @@
+ {
+ 	if (pvt->initialized)
+ 	{
++		struct timespec now;
++
++		clock_gettime(CLOCK_MONOTONIC, &now);
+ 		pvt->ring = 1;
++		/* Phonelet: a RING without a call defers SMS rescans only briefly */
++		pvt->phonelet_ring_at = now.tv_sec;
+ 		pvt->dialing = 0;
+ 		pvt->cwaiting = 0;
+ 
+@@ -1165,25 +1336,14 @@
+ int
+ at_poll_sms (struct pvt *pvt)
+ {
+-	/* poll all SMSs stored in device */
+-	if (CONF_SHARED(pvt, disablesms) == 0)
+-	{
+-		int i;
+-
+-		for (i = 0; i != SMS_INDEX_MAX; i++)
+-		{
+-			if (at_enqueue_retrieve_sms(&pvt->sys_chan, i, SUPPRESS_ERROR_ENABLED))
+-			{
+-				ast_log (LOG_ERROR, "[%s] Error sending CMGR to retrieve SMS message #%d\n", PVT_ID(pvt), i);
+-				return -1;
+-			}
+-		}
+-		return 0;
+-	}
+-	else
+-	{
++	if (CONF_SHARED(pvt, disablesms))
+ 		return -1;
+-	}
++	pvt->phonelet_poll_active = 1;
++	pvt->phonelet_poll_cursor = 0;
++	memset(pvt->phonelet_poll_seen, 0, sizeof(pvt->phonelet_poll_seen));
++	if (pvt->incoming_sms_index == -1U)
++		at_retrieve_next_sms(&pvt->sys_chan, SUPPRESS_ERROR_ENABLED);
++	return 0;
+ }
+ 
+ /*!
+@@ -1210,7 +1370,7 @@
+ 	{
+ 		ast_debug (1, "[%s] Incoming SMS message\n", PVT_ID(pvt));
+ 
+-		if (at_enqueue_retrieve_sms(&pvt->sys_chan, index, SUPPRESS_ERROR_DISABLED))
++		if (phonelet_storage_notice(pvt, str, index))
+ 		{
+ 			ast_log (LOG_ERROR, "[%s] Error sending CMGR to retrieve SMS message\n", PVT_ID(pvt));
+ 			return -1;
+@@ -1314,6 +1474,14 @@
+             /* A user read (dongle cmd, DongleSendAT) is displayed only. */
+             if (!inbox_read)
+                 return 0;
++            if (pvt->phonelet_poll_active && pvt->incoming_sms_index < SMS_INDEX_MAX
++                && !pvt->phonelet_poll_seen[pvt->incoming_sms_index]) {
++                pvt->phonelet_poll_seen[pvt->incoming_sms_index] = 1;
++                if (pvt->phonelet_rescan_active) {
++                    if (pvt->phonelet_mem == PHONELET_MEM_SM) pvt->phonelet_rescan_sm++;
++                    else pvt->phonelet_rescan_me++;
++                }
++            }
+             pvt->phonelet_parse_retry_slot = 0;
+             /* at_parse_cmgr decodes the PDU in place. Save its complete hex
+              * identity first, excluding mutable CMGR read/unread status. */
+@@ -1886,10 +2054,13 @@
+ 			case RES_CSSU:
+ 			case RES_SRVST:
+ 			case RES_CVOICE:
+-			case RES_CPMS:
+ 			case RES_CONF:
+ 				return 0;
+ 
++			case RES_CPMS:
++				phonelet_storage_counts(pvt, str);
++				return 0;
++
+ 			case RES_CMGS:
+ 				{
+ 					if (!task || !ecmd || task->cmds[0].cmd != CMD_AT_CMGS
+--- a/chan_dongle.c
++++ b/chan_dongle.c
+@@ -447,6 +447,50 @@
+  * \retval 1 unloading
+  */
+ 
++/* Called with the monitor lock. No catch-up: one pass per interval measured
++ * from completion, including a rejected selection. Never start over live work. */
++static void phonelet_rescan_tick(struct pvt *pvt)
++{
++	struct timespec now;
++	unsigned int i;
++
++	if (at_queue_head_cmd(pvt) || pvt->incoming_sms_index != -1U)
++		return;
++	for (i = 0; i < SMS_INDEX_MAX; i++)
++	{
++		if (!is_sms_inbox_set(pvt, i))
++			continue;
++		/* A slot waits with nothing queued: its read was not queued or not
++		 * written. The journal retry path reads it again. */
++		if (!pvt->phonelet_retry_at)
++			pvt->phonelet_retry_at = phonelet_monotonic() + 30;
++		return;
++	}
++	clock_gettime(CLOCK_MONOTONIC, &now);
++	if (pvt->phonelet_rescan_active)
++	{
++		pvt->phonelet_rescan_active = 0;
++		pvt->phonelet_rescan_end = now.tv_sec;
++		ast_log(LOG_NOTICE, "[%s] SMS rescan finished: SM=%u ME=%u\n", PVT_ID(pvt),
++		    pvt->phonelet_rescan_sm, pvt->phonelet_rescan_me);
++		return;
++	}
++	/* A call has a channel. ring can stay set without one (a missed call):
++	 * only a recent RING counts. dialing and cwaiting are not used: they can stick too. */
++	if (!pvt->initialized || !pvt->has_sms || CONF_SHARED(pvt, disablesms)
++	    || !PVT_NO_CHANS(pvt)
++	    || (pvt->ring && now.tv_sec - pvt->phonelet_ring_at < PHONELET_RING_WINDOW)
++	    || now.tv_sec - pvt->phonelet_rescan_end < PHONELET_RESCAN_INTERVAL)
++		return;
++	pvt->phonelet_rescan_active = 1;
++	pvt->phonelet_rescan_polled = 0;
++	pvt->phonelet_rescan_sm = pvt->phonelet_rescan_me = 0;
++	pvt->phonelet_mem_failed = 0;
++	ast_log(LOG_NOTICE, "[%s] SMS rescan started: SM=0 ME=0\n", PVT_ID(pvt));
++	/* Not queued or not written: the pass stops there (phonelet_storage_select) */
++	phonelet_storage_select(&pvt->sys_chan, PHONELET_MEM_SM, 0);
++}
++
+ static void* do_monitor_phone (void* data)
+ {
+ 	struct pvt*	pvt = (struct pvt*) data;
+@@ -474,6 +518,18 @@
+ 
+ 	clean_read_data(dev, fd);
+ 
++	/* Phonelet: SM after ATZ, until the init list selects ME. */
++	pvt->phonelet_mem = PHONELET_MEM_SM;
++	pvt->phonelet_mem_switch = 0;
++	pvt->phonelet_mem_pending = 0;
++	pvt->phonelet_mem_failed = 0;
++	pvt->phonelet_counts_valid = pvt->phonelet_poll_active = 0;
++	pvt->phonelet_rescan_active = !CONF_SHARED(pvt, disablesms);
++	pvt->phonelet_rescan_polled = 0;
++	pvt->phonelet_rescan_sm = pvt->phonelet_rescan_me = 0;
++	if (pvt->phonelet_rescan_active)
++		ast_log(LOG_NOTICE, "[%s] SMS rescan started: SM=0 ME=0\n", dev);
++
+ 	/* schedule dongle initilization  */
+ 	if (at_enqueue_initialization(&pvt->sys_chan, CMD_AT))
+ 	{
+@@ -481,11 +537,8 @@
+ 		goto e_cleanup;
+ 	}
+ 
+-	/* Poll first SMS, if any */
+-	if (at_poll_sms(pvt) == 0)
+-	{
+-		ast_debug (1, "[%s] Polling first SMS message\n", PVT_ID(pvt));
+-	}
++	/* The existing CPMS selection callback starts the first poll, after its
++	 * counts arrive. Do not prequeue an unbounded read before initialization. */
+ 
+ 	ast_mutex_unlock (&pvt->lock);
+ 
+@@ -495,6 +548,7 @@
+ 		ast_mutex_lock (&pvt->lock);
+ 
+ 		handle_expired_reports(pvt);
++		phonelet_rescan_tick(pvt);
+         if (pvt->phonelet_retry_at && phonelet_monotonic() >= pvt->phonelet_retry_at
+             && pvt->incoming_sms_index == -1U) {
+             pvt->phonelet_retry_at = 0;
+--- a/chan_dongle.h
++++ b/chan_dongle.h
+@@ -168,6 +168,18 @@
+ 	char phonelet_bad_pdu[4096];
+ 	time_t phonelet_retry_at;
+ 	unsigned int phonelet_spool_failed;
++	/* Phonelet SMS memories (PHONELET_MEM_* masks): the one CMGR and CMGD use,
++	 * the target of a queued AT+CPMS, ones a +CMTI named, ones the modem rejected */
++	unsigned int phonelet_mem;
++	unsigned int phonelet_mem_switch;
++	unsigned int phonelet_mem_pending;
++	unsigned int phonelet_mem_failed;
++	/* CPMS counts belong to the currently queued selection, never a prior one. */
++	unsigned int phonelet_counts_valid, phonelet_total;
++	unsigned int phonelet_poll_active, phonelet_poll_cursor;
++	unsigned char phonelet_poll_seen[SMS_INDEX_MAX];
++	unsigned int phonelet_rescan_active, phonelet_rescan_polled, phonelet_rescan_sm, phonelet_rescan_me;
++	time_t phonelet_rescan_end, phonelet_ring_at;	/* CLOCK_MONOTONIC seconds */
+ 	unsigned int		incoming_sms_index;
+ 	sms_inbox_item_type	incoming_sms_inbox[SMS_INBOX_ARRAY_SIZE];
+ 

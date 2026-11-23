@@ -1,0 +1,8 @@
+# ARCH ARCHIVE_SHA256 ASTERISK_SHA256 CHAN_DONGLE_SHA256 URL
+# Release tags are asterisk-VERSION-N; N counts builds of one Asterisk version.
+# Build 4 (the build 3 sources; the systemd drop-in also orders Asterisk after time-set.target and sets
+# UMask=0077). arm64 runs on the reference board (on-device upgrade, modem registers; calls and SMS were
+# tested on hardware with build 3, same chan_dongle.so); amd64 was installed in a VM without a live SIM.
+# All-zero sums (a build not made yet) stop fetch-asterisk.sh with "not published yet".
+arm64 50b85783b7b34681717feeb0c717d49d3f882431aac26ae90f92c45f0768ef68 f70692266103d6fe078e17bcda7d84ce68e63bfbfccde30f41e1b62d66114b38 2ac5dae0722e28eea4bd5d06ec7f5b23cd65eea67d91cfdf947d96da54f794e2 https://github.com/stlk0/phonelet/releases/download/asterisk-20.22.0-4/asterisk-20.22.0-arm64.tar.gz
+amd64 e7f1265fc2eafe15ca07b6a98a7c388d482261605b8ed1ea11dde8f65952d8d8 9e359357a197961b2120f795ec62b509b284886c967111cf4c527ac32a1c7182 c7a2dcd85675a99175a3c6283b1f5fa09e22ca0ce23420edc1b25686cf556598 https://github.com/stlk0/phonelet/releases/download/asterisk-20.22.0-4/asterisk-20.22.0-amd64.tar.gz

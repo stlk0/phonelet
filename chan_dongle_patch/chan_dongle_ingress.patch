@@ -1,0 +1,608 @@
+Journal received and unparsed SMS durably before deleting modem slots.
+
+Each SMS-DELIVER fragment is written to the phonelet spool (fsync of the
+file and its directory) before the inbox may delete the slot; Python owns
+assembly. One retry distinguishes a contaminated read from a stable bad
+PDU: two identical failed reads publish a U1 record for a durable owner
+alert. Publish without replacement using link/unlink, and encode text by
+its decoded byte length. Replace lone UTF-16 surrogates on SMS receive
+only, keeping valid pairs and strict outgoing encoding. Bind the parse
+retry to its slot and clear it on reconnect. A linked record remains
+published if temporary-name cleanup fails; directory fsync is required.
+Guard queue allocation before assigning its UID.
+A fragment the journal rejects (concatenation part 0 or above its
+total) never becomes valid: it is journaled as U1 too, and its slot
+deleted. phonelet_spool tells such a rejected record from an I/O failure;
+only the latter keeps the slot for the 30-second retry.
+The retry deadline is on CLOCK_MONOTONIC (phonelet_monotonic), so a
+wall-clock step neither delays nor hurries it.
++CMGR carries no slot number. After an inbox CMGR answered by OK or an
+error, AT is queued before the next read, so that a late +CMGR arrives
+while no SMS read is at the queue head and is never journaled as the
+next slot, whose SMS would be deleted unjournaled.
+A +CMGR header with fewer than two commas fails the read instead of
+reading its unset length field.
+AMI DongleShowDevices reports SMSJournalVersion and
+SMSJournalStatus. A user CMGR is displayed only.
+License: GPL-2.0 (same as chan_dongle).
+--- a/at_command.c
++++ b/at_command.c
+@@ -749,6 +749,7 @@
+ 		return 0;
+ 	}
+ 
++	pvt->phonelet_parse_retry_slot = 0; /* fresh read, unless the caller marks a retry */
+ 	pvt->incoming_sms_index = index;
+ 
+ 	err = at_fill_generic_cmd (&cmds[0], "AT+CMGR=%d\r", index);
+@@ -793,6 +794,31 @@
+ 	return 0;
+ }
+ 
++/*!
++ * \brief Phonelet: queue AT after an SMS read answered without +CMGR
++ * \param cpvt -- cpvt structure
++ * \return 0 on success
++ *
++ * +CMGR carries no slot number: a reply belongs to a slot only by the order
++ * of the command queue. An OK or error taken for an inbox CMGR may be an
++ * extra or late answer to an earlier command, the CMGR's own +CMGR still on
++ * its way. The modem answers in order, so a +CMGR still due arrives before
++ * the reply to this AT, while no SMS read is at the head of the queue: it is
++ * ignored instead of being journaled as the next slot, whose SMS would then
++ * be deleted without ever reaching the journal.
++ */
++EXPORT_DEF int phonelet_enqueue_sms_sync(struct cpvt *cpvt)
++{
++	static const char cmd[] = "AT\r";
++	static at_queue_cmd_t at_cmd = ATQ_CMD_DECLARE_ST(CMD_AT_SMS_SYNC, cmd);
++
++	if (at_queue_insert_const(cpvt, &at_cmd, 1, 0) != 0) {
++		chan_dongle_err = E_QUEUE;
++		return -1;
++	}
++	return 0;
++}
++
+ /*!
+  * \brief Enqueue AT+CHLD1x or AT+CHUP hangup command
+  * \param cpvt -- channel_pvt structure
+--- a/at_command.h
++++ b/at_command.h
+@@ -39,6 +39,7 @@
+ 	_( AT_CMGD,         "AT+CMGD") \
+ 	_( AT_CMGF,         "AT+CMGF") \
+ 	_( AT_CMGR,         "AT+CMGR") \
++	_( AT_SMS_SYNC,     "AT") \
+ \
+ 	_( AT_CMGS,         "AT+CMGS") \
+ 	_( AT_SMSTEXT,      "SMSTEXT") \
+@@ -120,6 +121,7 @@
+ EXPORT_DECL void at_retrieve_next_sms(struct cpvt *cpvt, at_cmd_suppress_error_t suppress_error);
+ EXPORT_DECL int at_enqueue_retrieve_sms(struct cpvt *cpvt, int index, at_cmd_suppress_error_t suppress_error);
+ EXPORT_DECL int at_enqueue_delete_sms(struct cpvt *cpvt, int index);
++EXPORT_DECL int phonelet_enqueue_sms_sync(struct cpvt *cpvt);
+ EXPORT_DECL int at_enqueue_hangup(struct cpvt *cpvt, int call_idx);
+ EXPORT_DECL int at_enqueue_volsync(struct cpvt *cpvt);
+ EXPORT_DECL int at_enqueue_clcc(struct cpvt *cpvt);
+--- a/at_parse.c
++++ b/at_parse.c
+@@ -359,6 +359,7 @@
+ 
+ 	if (mark_line(str, delimiters, marks) != ITEMS_OF(marks)) {
+ 		chan_dongle_err = E_PARSE_CMGR_LINE;
++		return -1;
+ 	}
+ 	tpdu_length = strtol(marks[1] + 1, &end, 10);
+ 	if (tpdu_length <= 0 || end[0] != '\r') {
+@@ -405,7 +406,7 @@
+ 			/* tpdu_parse_deliver sets chan_dongle_err */
+ 			return -1;
+ 		}
+-		res = ucs2_to_utf8(msg16_tmp, res, msg, *msg_len);
++		res = ucs2_to_utf8_lenient(msg16_tmp, res, msg, *msg_len);
+ 		if (res < 0) {
+ 			chan_dongle_err = E_PARSE_UCS2;
+ 			return -1;
+--- a/at_queue.c
++++ b/at_queue.c
+@@ -293,7 +293,6 @@
+ {
+ 	unsigned idx;
+ 	at_queue_task_t *task = at_queue_add(cpvt, cmds, cmdsno, athead);
+-	task->uid = uid;
+ 
+ 	if(!task)
+ 	{
+@@ -303,6 +302,9 @@
+ 		}
+ 	}
+ 
++	if (task)
++		task->uid = uid;
++
+ 	if (at_queue_run(cpvt->pvt))
+ 		task = NULL;
+ 
+--- a/at_response.c
++++ b/at_response.c
+@@ -26,6 +26,7 @@
+ #include "manager.h"
+ #include "channel.h"				/* channel_queue_hangup() channel_queue_control() */
+ #include "smsdb.h"
++#include "phonelet_ingress.h"
+ #include "error.h"
+ 
+ #define CCWA_STATUS_NOT_ACTIVE	0
+@@ -62,6 +63,28 @@
+ 	return "UNDEFINED";
+ }
+ 
++/*!
++ * \brief Phonelet: an inbox CMGR answered by OK or an error instead of +CMGR
++ * \param pvt -- pvt structure
++ * \param suppress_error -- error suppression of the read, kept for the next one
++ *
++ * The next slot is read only after an AT, so that a +CMGR still due for
++ * this read is never taken for the next slot's (phonelet_enqueue_sms_sync).
++ * Without that AT nothing is read: the slot stays in the inbox and the
++ * journal retry reads it again after 30 s.
++ */
++static void phonelet_sms_unanswered(struct pvt *pvt, at_cmd_suppress_error_t suppress_error)
++{
++	if (phonelet_enqueue_sms_sync(&pvt->sys_chan))
++	{
++		ast_log(LOG_ERROR, "[%s] Error queueing AT after an SMS read; reading again in 30 s\n", PVT_ID(pvt));
++		pvt->incoming_sms_index = -1U;
++		pvt->phonelet_retry_at = phonelet_monotonic() + 30;
++		return;
++	}
++	at_retrieve_next_sms(&pvt->sys_chan, suppress_error);
++}
++
+ /*!
+  * \brief Handle OK response
+  * \param pvt -- pvt structure
+@@ -230,7 +253,10 @@
+ 
+ 			case CMD_AT_CMGR:
+ 				ast_debug (1, "[%s] SMS message see later\n", PVT_ID(pvt));
+-				at_retrieve_next_sms(&pvt->sys_chan, at_cmd_suppress_error_mode(ecmd->flags));
++				phonelet_sms_unanswered(pvt, at_cmd_suppress_error_mode(ecmd->flags));
++				break;
++
++			case CMD_AT_SMS_SYNC:
+ 				break;
+ 
+ 			case CMD_AT_CMGD:
+@@ -318,6 +344,7 @@
+ 			case CMD_AT_CCWA_SET:
+ 			case CMD_AT_CCWA_STATUS:
+ 			case CMD_AT_CNUM:
++			case CMD_AT_SMS_SYNC:
+ 				log_cmd_response_error(pvt, ecmd, "[%s] Command '%s' failed\n", PVT_ID(pvt), at_cmd2str (ecmd->cmd));
+ 				/* mean ignore error */
+ 				break;
+@@ -449,7 +476,7 @@
+ 
+ 			case CMD_AT_CMGR:
+ 				log_cmd_response_error(pvt, ecmd, "[%s] Error reading SMS message\n", PVT_ID(pvt));
+-				at_retrieve_next_sms(&pvt->sys_chan, at_cmd_suppress_error_mode(ecmd->flags));
++				phonelet_sms_unanswered(pvt, at_cmd_suppress_error_mode(ecmd->flags));
+ 				break;
+ 
+ 			case CMD_AT_CMGD:
+@@ -1256,30 +1283,50 @@
+ 	int mr, st;
+ 	char		msg[4096];
+ 	int		res;
+-	char		text_base64[40800];
+ 	size_t msg_len = sizeof(msg);
+ 	int tpdu_type;
+ 	pdu_udh_t	udh;
+ 	pdu_udh_init(&udh);
+-	char fullmsg[160 * 255];
+-	int fullmsg_len;
+-	int csms_cnt;
+ 	char buf[512];
+ 	char payload[SMSDB_PAYLOAD_MAX_LEN];
+ 	ssize_t payload_len;
+ 	int status_report[256];
++	char raw_pdu[4096] = "";
++	const char *pdu_start;
++	size_t pdu_chars;
++	int spooled;
+ 
+ 	const struct at_queue_cmd * ecmd = at_queue_head_cmd(pvt);
++    /* The result handler frees the queue task containing ecmd. */
++    const at_cmd_suppress_error_t suppress_error = ecmd
++        ? at_cmd_suppress_error_mode(ecmd->flags) : SUPPRESS_ERROR_DISABLED;
++    /* Only the inbox's own read may be journaled and deleted from the SIM. */
++    const int inbox_read = ecmd && ecmd->cmd == CMD_AT_CMGR;
++    const int parse_retry = pvt->phonelet_parse_retry_slot
++        && pvt->phonelet_parse_retry_slot == pvt->incoming_sms_index + 1;
+ 
+ 	manager_event_message("DongleNewCMGR", PVT_ID(pvt), str);
+ 	if (ecmd) {
+ 		if (ecmd->res == RES_CMGR || ecmd->cmd == CMD_USER) {
+ 			at_queue_handle_result (pvt, RES_CMGR);
+ 
++            /* A user read (dongle cmd, DongleSendAT) is displayed only. */
++            if (!inbox_read)
++                return 0;
++            pvt->phonelet_parse_retry_slot = 0;
++            /* at_parse_cmgr decodes the PDU in place. Save its complete hex
++             * identity first, excluding mutable CMGR read/unread status. */
++            pdu_start = strchr(str, '\n');
++            pdu_chars = pdu_start ? strspn(++pdu_start, "0123456789abcdefABCDEF") : 0;
++            /* An interleaved URC is not evidence of a permanently bad PDU.
++             * Only an entire, nonempty hex line can match on the second read. */
++            if (!pdu_chars || pdu_chars >= sizeof(raw_pdu) || pdu_start[pdu_chars])
++                goto parse_failed;
++            memcpy(raw_pdu, pdu_start, pdu_chars);
++            raw_pdu[pdu_chars] = '\0';
+ 			res = at_parse_cmgr(str, len, &tpdu_type, sca, sizeof(sca), oa, sizeof(oa), scts, &mr, &st, dt, msg, &msg_len, &udh);
+ 			if (res < 0) {
+-				ast_log(LOG_WARNING, "[%s] Error parsing incoming message: %s\n", PVT_ID(pvt), error2str(chan_dongle_err));
+-				goto receive_next_no_delete;
++                goto parse_failed;
+ 			}
+ 			switch (PDUTYPE_MTI(tpdu_type)) {
+ 			case PDUTYPE_MTI_SMS_STATUS_REPORT:
+@@ -1313,42 +1360,18 @@
+ 				}
+ 				break;
+ 			case PDUTYPE_MTI_SMS_DELIVER:
+-				ast_debug (1, "[%s] Successfully read SM\n", PVT_ID(pvt));
+-				if (udh.parts > 1) {
+-					ast_verb (1, "[%s] Got SM part from %s: '%s'; [ref=%d, parts=%d, order=%d]\n", PVT_ID(pvt), oa, msg, udh.ref, udh.parts, udh.order);
+-					csms_cnt = smsdb_put(pvt->imsi, oa, udh.ref, udh.parts, udh.order, msg, fullmsg);
+-					if (csms_cnt <= 0) {
+-						ast_log(LOG_ERROR, "[%s] Error putting SMS to SMSDB\n", PVT_ID(pvt));
+-						goto receive_as_is;
+-					}
+-					if (csms_cnt < udh.parts) {
+-						ast_verb (1, "[%s] Waiting for following parts\n", PVT_ID(pvt));
+-						goto receive_next;
+-					}
+-					fullmsg_len = strlen(fullmsg);
+-				} else {
+-receive_as_is:
+-					ast_verb (1, "[%s] Got single SM from %s: '%s'\n", PVT_ID(pvt), oa, msg);
+-					strncpy(fullmsg, msg, msg_len);
+-					fullmsg[msg_len] = '\0';
+-					fullmsg_len = msg_len;
+-				}
+-
+-				ast_verb (1, "[%s] Got full SMS from %s: '%s'\n", PVT_ID(pvt), oa, fullmsg);
+-				ast_base64encode (text_base64, (unsigned char*)fullmsg, fullmsg_len, sizeof(text_base64));
++                /* Python is the sole assembly owner. Persist EVERY fragment before
++                 * entering receive_next (which may enqueue SIM deletion). No SMSDB
++                 * assembly or fire-and-forget SMS/Local events on this path. */
++                spooled = phonelet_spool(PHONELET_SMS_SPOOL, PVT_ID(pvt), pvt->imsi,
++                    scts, oa, udh.parts > 1 ? udh.ref : 0,
++                    udh.parts > 1 ? udh.parts : 1, udh.parts > 1 ? udh.order : 1, msg, msg_len,
++                    pvt->incoming_sms_index, raw_pdu);
++                if (spooled == PHONELET_SPOOL_REJECTED)
++                    goto journal_rejected;
++                if (spooled)
++                    goto journal_failed;
+ 
+-				manager_event_new_sms(PVT_ID(pvt), oa, fullmsg);
+-				manager_event_new_sms_base64(PVT_ID(pvt), oa, text_base64);
+-				{
+-					channel_var_t vars[] =
+-					{
+-						{ "SMS", fullmsg } ,
+-						{ "SMS_BASE64", text_base64 },
+-						{ "SMS_TS", scts },
+-						{ NULL, NULL },
+-					};
+-					start_local_channel (pvt, "sms", oa, vars);
+-				}
+ 				break;
+ 			}
+ 		}
+@@ -1356,14 +1379,18 @@
+ 		{
+ 			ast_log (LOG_ERROR, "[%s] Received '+CMGR' when expecting '%s' response to '%s', ignoring\n", PVT_ID(pvt),
+ 					at_res2str (ecmd->res), at_cmd2str (ecmd->cmd));
++			/* A stale or misrouted reply never deletes or advances the inbox. */
++			return 0;
+ 		}
+-receive_next:
++delete_received:
+ 		if (CONF_SHARED(pvt, autodeletesms) && pvt->incoming_sms_index != -1U)
+ 		{
+ 			at_enqueue_delete_sms(&pvt->sys_chan, pvt->incoming_sms_index);
+ 		}
+ receive_next_no_delete:
+-		at_retrieve_next_sms(&pvt->sys_chan, at_cmd_suppress_error_mode(ecmd->flags));
++		at_retrieve_next_sms(&pvt->sys_chan, suppress_error);
++        if (pvt->incoming_sms_index == -1U && !pvt->phonelet_retry_at)
++            pvt->phonelet_spool_failed = 0;
+ 	}
+ 	else
+ 	{
+@@ -1371,6 +1398,50 @@
+ 	}
+ 
+ 	return 0;
++
++parse_failed:
++    if (!parse_retry) {
++        unsigned slot = pvt->incoming_sms_index;
++        memcpy(pvt->phonelet_bad_pdu, raw_pdu, strlen(raw_pdu) + 1);
++        pvt->incoming_sms_index = -1U;
++        if (at_enqueue_retrieve_sms(&pvt->sys_chan, slot, suppress_error)) {
++            ast_log(LOG_WARNING, "[%s] Cannot retry SMS slot %u; retaining in modem\n", PVT_ID(pvt), slot);
++            pvt->phonelet_retry_at = phonelet_monotonic() + 30;
++        } else {
++            pvt->phonelet_parse_retry_slot = slot + 1;
++        }
++        return 0;
++    }
++    if (!raw_pdu[0] || strcmp(raw_pdu, pvt->phonelet_bad_pdu)) {
++        ast_log(LOG_WARNING, "[%s] SMS slot %u failed two inconsistent reads; retaining in modem\n",
++                PVT_ID(pvt), pvt->incoming_sms_index);
++        goto receive_next_no_delete;
++    }
++    ast_log(LOG_WARNING, "[%s] SMS slot %u unparsed after two identical reads\n",
++            PVT_ID(pvt), pvt->incoming_sms_index);
++    goto journal_unparsed;
++
++journal_rejected:
++    /* The concatenation header numbers this part outside its total (part 0,
++     * or above the total). Such a record never becomes valid, so a retry
++     * would hold the slot and the inbox forever: keep the raw PDU instead. */
++    ast_log(LOG_WARNING, "[%s] SMS slot %u has an invalid concatenation header (part %d of %d)\n",
++            PVT_ID(pvt), pvt->incoming_sms_index, udh.order, udh.parts);
++journal_unparsed:
++    if (phonelet_spool(PHONELET_SMS_SPOOL, PVT_ID(pvt), pvt->imsi,
++                       "", "", 0, 1, 1, NULL, 0, pvt->incoming_sms_index, raw_pdu))
++        goto journal_failed;
++    ast_log(LOG_WARNING, "[%s] SMS slot %u raw PDU journaled as unparsed\n", PVT_ID(pvt), pvt->incoming_sms_index);
++    goto delete_received;
++
++journal_failed:
++    ast_log(LOG_ERROR, "[%s] Phonelet SMS journal failed; retaining SMS on SIM\n", PVT_ID(pvt));
++    pvt->phonelet_spool_failed = 1;
++    pvt->phonelet_retry_at = phonelet_monotonic() + 30;
++    /* Keep the inbox bit; the normal next helper clears it.
++     * The monitor retries pending inbox slots after backoff. */
++    pvt->incoming_sms_index = -1U;
++    return 0;
+ }
+ 
+ /*!
+@@ -1754,7 +1825,7 @@
+ static void at_response_busy(struct pvt* pvt, enum ast_control_frame_type control)
+ {
+ 	const struct at_queue_task * task = at_queue_head_task (pvt);
+-	struct cpvt* cpvt = task->cpvt;
++	struct cpvt* cpvt = task ? task->cpvt : &pvt->sys_chan;
+ 
+ 	if(cpvt == &pvt->sys_chan)
+ 		cpvt = pvt->last_dialed_cpvt;
+--- a/chan_dongle.c
++++ b/chan_dongle.c
+@@ -461,6 +461,8 @@
+ 	int 		fd;
+ 	int		read_result = 0;
+ 
++	/* A queued parse retry belongs only to this connection and slot. */
++	pvt->phonelet_parse_retry_slot = 0;
+ 	pvt->timeout = DATA_READ_TIMEOUT;
+ 	rb_init (&rb, buf, sizeof (buf));
+ 
+@@ -493,6 +495,19 @@
+ 		ast_mutex_lock (&pvt->lock);
+ 
+ 		handle_expired_reports(pvt);
++        if (pvt->phonelet_retry_at && phonelet_monotonic() >= pvt->phonelet_retry_at
++            && pvt->incoming_sms_index == -1U) {
++            pvt->phonelet_retry_at = 0;
++            at_retrieve_next_sms(&pvt->sys_chan, SUPPRESS_ERROR_DISABLED);
++            if (pvt->incoming_sms_index == -1U) {
++                unsigned int pending = 0;
++                for (unsigned int slot = 0; slot < SMS_INDEX_MAX; ++slot)
++                    pending |= !!is_sms_inbox_set(pvt, slot);
++                if (pending) pvt->phonelet_retry_at = phonelet_monotonic() + 30;
++                else pvt->phonelet_spool_failed = 0;
++            }
++            if (at_queue_run(pvt)) goto e_cleanup;
++        }
+ 
+ 		if (port_status (pvt->data_fd) || port_status (pvt->audio_fd))
+ 		{
+--- a/chan_dongle.h
++++ b/chan_dongle.h
+@@ -164,6 +164,10 @@
+ 	char			cell_id[8];
+ 	char			sms_scenter[20];
+ 
++	unsigned int phonelet_parse_retry_slot;
++	char phonelet_bad_pdu[4096];
++	time_t phonelet_retry_at;
++	unsigned int phonelet_spool_failed;
+ 	unsigned int		incoming_sms_index;
+ 	sms_inbox_item_type	incoming_sms_inbox[SMS_INBOX_ARRAY_SIZE];
+ 
+@@ -204,6 +208,17 @@
+ 	pvt_stat_t		stat;				/*!< various statistics */
+ } pvt_t;
+ 
++#include <time.h>
++
++/* Phonelet: seconds of CLOCK_MONOTONIC for phonelet_retry_at, so that a
++ * wall-clock step (a board without RTC, NTP) does not move a retry. */
++static inline time_t phonelet_monotonic(void)
++{
++	struct timespec now;
++	clock_gettime(CLOCK_MONOTONIC, &now);
++	return now.tv_sec;
++}
++
+ #define CONF_GLOBAL(name)		(gpublic->global_settings.name)
+ #define SCONF_GLOBAL(state, name)	((state)->global_settings.name)
+ 
+--- a/char_conv.c
++++ b/char_conv.c
+@@ -80,6 +80,28 @@
+ }
+ 
+ 
++/* Received fragments may split a UTF-16 pair. Keep valid pairs, but replace
++ * lone surrogates so readable SMS reach the journal rather than quarantine.
++ * The strict conversion used by outgoing encoding and USSD is unchanged. */
++EXPORT_DEF ssize_t ucs2_to_utf8_lenient(const uint16_t *in, size_t in_length, char *out, size_t out_size)
++{
++    uint16_t clean[in_length ? in_length : 1];
++    unsigned char *bytes = (unsigned char *)clean;
++    memcpy(clean, in, in_length * 2);
++    for (size_t i = 0; i < in_length; ++i) {
++        unsigned unit = (bytes[i * 2] << 8) | bytes[i * 2 + 1];
++        if (unit < 0xD800 || unit > 0xDFFF) continue;
++        if (unit <= 0xDBFF && i + 1 < in_length) {
++            unsigned next = (bytes[i * 2 + 2] << 8) | bytes[i * 2 + 3];
++            if (next >= 0xDC00 && next <= 0xDFFF) { ++i; continue; }
++        }
++        bytes[i * 2] = 0xFF;
++        bytes[i * 2 + 1] = 0xFD;
++    }
++    return ucs2_to_utf8(clean, in_length, out, out_size);
++}
++
++
+ static char hexchar2val(unsigned char h)
+ {
+ 	return lut_hex2val[h];
+--- a/char_conv.h
++++ b/char_conv.h
+@@ -9,6 +9,7 @@
+ #include <stdint.h>
+ 
+ EXPORT_DECL ssize_t utf8_to_ucs2(const char *in, size_t in_length, uint16_t *out, size_t out_size);
++EXPORT_DECL ssize_t ucs2_to_utf8_lenient(const uint16_t *in, size_t in_length, char *out, size_t out_size);
+ EXPORT_DECL ssize_t ucs2_to_utf8(const uint16_t *in, size_t in_length, char *out, size_t out_size);
+ EXPORT_DECL int unhex(const char *in, uint8_t *out);
+ EXPORT_DECL void hexify(const uint8_t *in, size_t in_length, char *out);
+--- a/manager.c
++++ b/manager.c
+@@ -75,6 +75,8 @@
+ 			astman_append (s, "DataState: %s\r\n", PVT_STATE(pvt, data_tty));
+ 			astman_append (s, "Voice: %s\r\n", (pvt->has_voice) ? "Yes" : "No");
+ 			astman_append (s, "SMS: %s\r\n", (pvt->has_sms) ? "Yes" : "No");
++            astman_append(s, "SMSJournalVersion: 1\r\n");
++            astman_append(s, "SMSJournalStatus: %s\r\n", pvt->phonelet_spool_failed ? "error" : "ok");
+ 			astman_append (s, "Manufacturer: %s\r\n", pvt->manufacturer);
+ 			astman_append (s, "Model: %s\r\n", pvt->model);
+ 			astman_append (s, "Firmware: %s\r\n", pvt->firmware);
+--- a/pdu.h
++++ b/pdu.h
+@@ -26,7 +26,7 @@
+ 
+ typedef struct pdu_udh
+ {
+-	uint8_t ref;
++	uint16_t ref;
+ 	uint8_t parts, order;
+ 	uint8_t ls, ss;
+ } pdu_udh_t;
+--- /dev/null
++++ b/phonelet_ingress.h
+@@ -0,0 +1,94 @@
++/* Phonelet fragment journal v1. No Asterisk dependencies: tested as standalone C.
++ * Directory must be provisioned on durable local storage, private to services.
++ * Success means file contents AND directory entry have reached fsync.
++ * Consumer never modifies these files. Retention requires a backed-up database.
++ * Tab-separated records, one newline-terminated record per immutable file:
++ * 1 <device hex> <sim hex> <stamp hex> <sender hex> <ref> <parts> <part>
++ *   <text hex (text_len bytes, including NUL)> <slot> <raw PDU hex>
++ * U1 <device hex> <sim hex> <slot> <raw PDU hex>
++ * NULL text selects U1: two failed reads of the same nonempty raw PDU, or a
++ * fragment the journal rejects.
++ * phonelet_spool returns PHONELET_SPOOL_OK, PHONELET_SPOOL_IO_ERROR (nothing
++ * published; retry later) or PHONELET_SPOOL_REJECTED (the record itself is
++ * invalid and never becomes valid: retrying cannot help).
++ */
++#ifndef PHONELET_INGRESS_H
++#define PHONELET_INGRESS_H
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <fcntl.h>
++#include <errno.h>
++#include <limits.h>
++#include <sys/stat.h>
++
++#define PHONELET_SPOOL_OK 0
++#define PHONELET_SPOOL_IO_ERROR (-1)
++#define PHONELET_SPOOL_REJECTED (-2)
++
++#ifndef PHONELET_SMS_SPOOL
++#define PHONELET_SMS_SPOOL "/var/spool/asterisk/phonelet-sms"
++#endif
++
++static int phonelet_hex(FILE *f, const char *s, size_t length)
++{
++    const unsigned char *p = (const unsigned char *)s;
++    for (size_t i = 0; i < length; ++i) {
++        if (fprintf(f, "%02x", p[i]) < 0) return -1;
++    }
++    return 0;
++}
++
++static int phonelet_spool(const char *dir, const char *device, const char *sim,
++    const char *stamp, const char *sender, int ref, int parts, int part,
++    const char *text, size_t text_len, unsigned slot, const char *pdu)
++{
++    char tmp[PATH_MAX] = "", final[PATH_MAX];
++    const char *fields[] = { device, sim, stamp, sender };
++    int fd = -1, dfd = -1, result = PHONELET_SPOOL_IO_ERROR, temporary = 0;
++    FILE *f = NULL;
++    if (parts < 1 || parts > 255 || part < 1 || part > parts) return PHONELET_SPOOL_REJECTED;
++    if (strlen(dir) + sizeof("/.fragment-XXXXXX.sms") > sizeof(tmp)) return PHONELET_SPOOL_IO_ERROR;
++    dfd = open(dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
++    if (dfd < 0) return PHONELET_SPOOL_IO_ERROR;
++    for (unsigned attempt = 0; attempt < 8; ++attempt) {
++        snprintf(tmp, sizeof(tmp), "%s/.fragment-XXXXXX", dir);
++        fd = mkstemp(tmp); /* mode 0600: spool parent is trusted and not world-writable */
++        if (fd < 0) goto done;
++        temporary = 1;
++        if (fchmod(fd, 0640)) { close(fd); goto done; } /* trusted shared service group */
++        f = fdopen(fd, "w");
++        if (!f) { close(fd); goto done; }
++        if (fprintf(f, "%s", text ? "1" : "U1") < 0) goto done;
++        for (unsigned i = 0; i < (text ? 4U : 2U); ++i) {
++            if (fputc('\t', f) == EOF || phonelet_hex(f, fields[i], strlen(fields[i]))) goto done;
++        }
++        if (text && (fprintf(f, "\t%d\t%d\t%d\t", ref, parts, part) < 0
++                     || phonelet_hex(f, text, text_len))) goto done;
++        if (fprintf(f, "\t%u\t%s\n", slot, pdu) < 0 || fflush(f) || fsync(fd)) goto done;
++        if (fclose(f)) { f = NULL; goto done; }
++        f = NULL;
++        memcpy(final, tmp, strlen(tmp));
++        memcpy(final + strlen(tmp), ".sms", 5);
++        /* Never replace a published record. A crash between link and unlink
++         * or a failed unlink may leave a temporary name without .sms; replay ignores it. */
++        if (link(tmp, final)) {
++            if (errno != EEXIST) goto done;
++            if (unlink(tmp)) goto done;
++            temporary = 0;
++            continue; /* bounded retry with a new mkstemp name */
++        }
++        (void)unlink(tmp); /* Publication succeeded; cleanup is best effort. */
++        temporary = 0;
++        if (fsync(dfd)) goto done;
++        result = PHONELET_SPOOL_OK;
++        break;
++    }
++done:
++    if (f) fclose(f);
++    if (temporary) unlink(tmp);
++    close(dfd);
++    return result;
++}
++#endif

@@ -1,0 +1,15 @@
+# Asterisk has no scheduled log rotation, so logrotate limits messages.log growth.
+# Call logs can contain phone numbers; create 0600 keeps new files private to root.
+/var/log/asterisk/messages.log {
+    monthly
+    maxsize 10M
+    rotate 12
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0600
+    postrotate
+        /usr/sbin/asterisk -rx 'logger reload' >/dev/null
+    endscript
+}

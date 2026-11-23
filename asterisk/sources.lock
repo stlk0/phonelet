@@ -1,0 +1,5 @@
+ASTERISK_REPOSITORY=https://github.com/asterisk/asterisk.git
+ASTERISK_COMMIT=7c225dc47bb43bf9862b2b147ed565b7b6113fed
+ASTERISK_VERSION=20.22.0
+CHAN_DONGLE_REPOSITORY=https://github.com/wdoekes/asterisk-chan-dongle.git
+CHAN_DONGLE_COMMIT=7db8e75bc2b7c81b173e1bb465e376e64a70319a

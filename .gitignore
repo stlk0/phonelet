@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+*.db
+*.db-wal
+*.db-shm
+.venv
+.test-build/
+.env
+.idea/
+.claude/
+asterisk/*_local.conf
+src/phonelet.egg-info/
+# One-off research tools, kept locally and not versioned (research/<topic>/README.md)
+/research/
+# Internal process files: the nested repo .dev (own git, no remote) and links into it
+/.dev/
+/CLAUDE.md
+/AGENTS.override.md
+/docs/dev
+/scripts/dev

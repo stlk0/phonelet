@@ -1,0 +1,44 @@
+name: CI
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.11', '3.13']
+    env:
+      PHONELET_REQUIRE_NODE: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc patch nodejs shellcheck
+      - name: Install Python dependencies
+        # The checkout's .venv, as in the AGENTS.md checks.
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --no-deps --require-hashes -r requirements-dev.lock
+      - name: Run tests
+        run: PYTHONPATH=src .venv/bin/python -m pytest tests/ -q
+      - name: Run ruff
+        run: .venv/bin/ruff check .
+      - name: Check shell syntax
+        run: |
+          for script in deploy.sh install.sh scripts/*.sh targets/*/profile.sh; do
+            bash -n "$script"
+          done
+      - name: Run ShellCheck
+        run: shellcheck -S warning deploy.sh install.sh scripts/*.sh targets/*/profile.sh
+      - name: Check storage permissions as root
+        if: matrix.python-version == '3.13'
+        run: |
+          docker run --rm --user 0:0 -v "$PWD:/repo:ro" -w /tmp docker.io/library/debian:13 bash -ec 'apt-get update && apt-get install -y --no-install-recommends python3 && python3 /repo/tests/storage_permissions_check.py /repo/scripts/provision-storage.sh'

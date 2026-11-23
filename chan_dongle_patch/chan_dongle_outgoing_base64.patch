@@ -1,0 +1,120 @@
+DongleSendSMSBase64: outgoing SMS text in Base64.
+
+The text is decoded after Asterisk has split the application arguments, so
+commas, quotes and dialplan syntax in the message stay text. Reject
+noncanonical padding, invalid symbols and nonzero unused bits with a
+content-free error log.
+Applies after ingress.
+License: GPL-2.0 (same as chan_dongle).
+--- a/app.c
++++ b/app.c
+@@ -13,6 +13,7 @@
+    bg <bg_one@mail.ru>
+ */
+ 
++#include <asterisk/utils.h>
+ #include <asterisk/app.h>	/* AST_DECLARE_APP_ARGS() ... */
+ #include <asterisk/pbx.h>	/* pbx_builtin_setvar_helper() */
+ #include <asterisk/module.h>	/* ast_register_application2() ast_unregister_application() */
+@@ -119,6 +120,88 @@
+ 	return 0;
+ }
+ 
++static int app_send_sms_base64_exec (attribute_unused struct ast_channel* channel, const char* data)
++{
++	char*	parse;
++	char *message;
++	int length, result;
++	size_t encoded_length, body_length, padding;
++	const char *alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++
++	AST_DECLARE_APP_ARGS (args,
++		AST_APP_ARG (device);
++		AST_APP_ARG (number);
++		AST_APP_ARG (message);
++		AST_APP_ARG (validity);
++		AST_APP_ARG (report);
++		AST_APP_ARG (payload);
++	);
++
++	if (ast_strlen_zero (data))
++	{
++		return -1;
++	}
++
++	parse = ast_strdupa (data);
++
++	AST_STANDARD_APP_ARGS (args, parse);
++
++	if (ast_strlen_zero (args.device))
++	{
++		ast_log (LOG_ERROR, "NULL device for message -- SMS will not be sent\n");
++		return -1;
++	}
++
++	if (ast_strlen_zero (args.number))
++	{
++		ast_log (LOG_ERROR, "NULL destination for message -- SMS will not be sent\n");
++		return -1;
++	}
++
++	if (ast_strlen_zero(args.payload))
++	{
++		ast_log(LOG_ERROR, "NULL payload for message -- SMS will not be sent\n");
++		return -1;
++	}
++
++	/* Parse only base64 syntax, then decode once. Never parse decoded SMS text. */
++	if (ast_strlen_zero(args.message)) {
++		goto invalid_base64;
++	}
++	encoded_length = strlen(args.message);
++	/* Bound allocation; 64 KiB exceeds the driver's supported multipart text. */
++	body_length = strspn(args.message, alphabet);
++	padding = encoded_length - body_length;
++	if (encoded_length > 65536 || encoded_length % 4 || !body_length || padding > 2 ||
++		strspn(args.message + body_length, "=") != padding)
++		goto invalid_base64;
++	/* Canonical padding: unused bits of the final sextet must be zero. */
++	if (padding && ((strchr(alphabet, args.message[body_length - 1]) - alphabet) &
++					(padding == 2 ? 15 : 3)))
++		goto invalid_base64;
++	message = ast_malloc(encoded_length + 1);
++	if (!message) {
++		return -1;
++	}
++	length = ast_base64decode((unsigned char *) message, args.message, encoded_length);
++	if (length <= 0 || memchr(message, '\0', length)) {
++		ast_free(message);
++		goto invalid_base64;
++	}
++	message[length] = '\0';
++	result = send_sms(args.device, args.number, message, args.validity,
++	                  args.report, args.payload, strlen(args.payload) + 1);
++	ast_free(message);
++	if (result < 0) {
++		ast_log(LOG_ERROR, "[%s] %s\n", args.device, error2str(chan_dongle_err));
++		return -1;
++	}
++	return 0;
++invalid_base64:
++	ast_log(LOG_ERROR, "Invalid Base64 SMS body -- SMS will not be sent\n");
++	return -1;
++}
++
+ static int app_send_ussd_exec(attribute_unused struct ast_channel* channel, const char* data)
+ {
+ 	char* parse;
+@@ -187,6 +270,12 @@
+ 		"  Report   - Boolean flag for report request\n"
+ 		"  Payload  - Unstructured data that will be included in delivery report\n"
+ 	},
++	{
++		"DongleSendSMSBase64",
++		app_send_sms_base64_exec,
++		"DongleSendSMSBase64(Device,Dest,Base64,Validity,Report,Payload)",
++		"UTF-8 SMS encoded with BASE64_ENCODE; decoded after argument parsing.\n"
++	},
+ 	{
+ 		"DongleSendUSSD",
+ 		app_send_ussd_exec,

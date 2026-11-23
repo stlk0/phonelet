@@ -1,0 +1,23 @@
+Keep a concurrently written command's own response deadline.
+
+Source: aster (https://github.com/Sheepsticked/aster), commit 65e5a21,
+docker/asterisk/patches/0010-chan-dongle-user-command-deadline.patch.
+Author: Sheepsticked. License: GPL-2.0 (same as chan_dongle).
+Ported by meaning to chan_dongle 7db8e75 after ingress, Base64 and
+unexpected-error: source line numbers differ. Recheck the sent command in the
+at_wait() timeout branch before treating it as expired.
+--- a/chan_dongle.c
++++ b/chan_dongle.c
+@@ -531,6 +531,12 @@
+ 		{
+ 			ast_mutex_lock (&pvt->lock);
+ 			ecmd = at_queue_head_cmd (pvt);
++			/* a command another thread wrote during this wait has a deadline of its own */
++			if(ecmd && ecmd->length == 0 && ast_tvdiff_ms (ecmd->timeout, ast_tvnow()) > 0)
++			{
++				ast_mutex_unlock (&pvt->lock);
++				continue;
++			}
+ 			if(ecmd)
+ 			{
+ 				ast_log (LOG_ERROR, "[%s] timedout while waiting '%s' in response to '%s'\n", dev, at_res2str (ecmd->res), at_cmd2str (ecmd->cmd));
